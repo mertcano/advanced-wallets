@@ -1,0 +1,668 @@
+openapi: 3.0.0
+
+info:
+  title: Advanced Wallets Key Provider API Interface Specification
+  version: 1.0.0
+  description: |
+    # API Interface for Advanced Wallet Integration
+
+    This specification defines the required API interface that must be implemented by clients to integrate
+    their KMS/HSM provider with advanced wallets through the advanced wallets key provider interface.
+
+    ## Purpose
+
+    Clients must implement this advanced wallets key provider API specification to enable secure cryptographic key storage and management
+    for advanced wallets. The implementation should connect to your organization's KMS/HSM provider.
+
+    ## Implementation Requirements
+
+    Your implementation must:
+    - Expose all endpoints defined in this specification
+    - Support the request/response schemas defined in this specification
+    - Integrate with your chosen KMS/HSM provider backend
+    - Handle encryption/decryption operations securely
+    - Support envelope encryption for large payloads
+
+tags:
+  - name: Key Management
+    description: Operations for storing and retrieving private keys
+  - name: Data Keys
+    description: Operations for generating and decrypting data encryption keys
+
+paths:
+  /key:
+    post:
+      tags:
+        - Key Management
+      summary: Store a private key
+      description: |
+        Store a new private key encrypted using the configured KMS/HSM provider.
+
+        The private key is encrypted before storage. The implementation uses envelope
+        encryption for large payloads and direct encryption for smaller payloads.
+
+        **Important**: Keys are identified by the combination of `pub` (public key) and `source` 
+        (user/backup). Attempting to store a duplicate will result in a 409 Conflict error.
+      operationId: storePrivateKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StoreKeyRequest'
+            examples:
+              userKey:
+                summary: Store a user key
+                value:
+                  prv: 'MIICXAIBAAKBgH3D4WKfdvhhj9TSGrI0FxAmdfiyfOphuM/kmLMIMKdahZLE5b8Y...'
+                  pub: 'MIGeMA0GCSqGSIb3DQEBAQUAA4GMADCBiAKBgH3D4WKfdvhhj9TSGrI0FxAmdfiyfO...'
+                  coin: 'sol'
+                  source: 'user'
+                  type: 'tss'
+              backupKey:
+                summary: Store a backup key
+                value:
+                  prv: 'MIICWwIBAAKBgGxj7AvFxTQ2jOHh8K9ZS...'
+                  pub: 'MIGdMA0GCSqGSIb3DQEBAQUAA4GLADCBhwKBgGxj7...'
+                  coin: 'btc'
+                  source: 'backup'
+                  type: 'independent'
+      responses:
+        '200':
+          description: Private key stored successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoreKeyResponse'
+              example:
+                pub: 'MIGeMA0GCSqGSIb3DQEBAQUAA4GMADCBiAKBgH3D4WKfdvhhj9TSGrI0FxAmdfiyfO...'
+                coin: 'sol'
+                source: 'user'
+                type: 'tss'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Duplicate key - entry with same pub and source already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                message: 'Duplicated Key for source: user and pub: MIGeMA0GCSqGSIb3DQEBAQUAA4...'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /key/{pub}:
+    get:
+      tags:
+        - Key Management
+      summary: Retrieve a private key
+      description: |
+        Retrieve and decrypt a previously stored private key.
+
+        The key is identified by the public key (`pub`) path parameter and the `source` query parameter.
+        The KMS/HSM provider decrypts the key before returning it.
+      operationId: getPrivateKey
+      parameters:
+        - name: pub
+          in: path
+          required: true
+          description: The public key associated with the private key to retrieve
+          schema:
+            type: string
+          example: 'MIGeMA0GCSqGSIb3DQEBAQUAA4GMADCBiAKBgH3D4WKfdvhhj9TSGrI0FxAmdfiyfO...'
+        - name: source
+          in: query
+          required: true
+          description: The key source type
+          schema:
+            $ref: '#/components/schemas/KeySource'
+          example: 'user'
+      responses:
+        '200':
+          description: Private key retrieved and decrypted successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetKeyResponse'
+              example:
+                prv: 'MIICXAIBAAKBgH3D4WKfdvhhj9TSGrI0FxAmdfiyfOphuM/kmLMIMKdahZLE5b8Y...'
+                pub: 'MIGeMA0GCSqGSIb3DQEBAQUAA4GMADCBiAKBgH3D4WKfdvhhj9TSGrI0FxAmdfiyfO...'
+                source: 'user'
+                type: 'independent'
+        '404':
+          description: Private key not found for the given pub and source
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                message: 'Entry with pub MIGeMA0GCSqGSIb3DQEBAQUAA4... and source user not found in database'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /sign:
+    post:
+      tags:
+        - Key Management
+      summary: Sign a transaction or message
+      description: |
+        Sign data using a private key stored in your KMS/HSM provider. This is only applicable to Multisig wallets.
+
+        **Request:**
+        - `pub`: Public key identifier
+        - `source`: Key source (`user` or `backup`)
+        - `signablePayload`: Data to sign (format varies by coin)
+        - `algorithm`: `ecdsa` or `eddsa`
+
+        **Response:**
+        - `signature`: Signed output (format varies by coin)
+      operationId: signTransaction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignRequest'
+            examples:
+              btcPsbt:
+                summary: Sign BTC PSBT (UTXO)
+                value:
+                  pub: 'xpub1234567890abcdefABCDEF...'
+                  source: 'user'
+                  signablePayload: '70736274ff...'
+                  algorithm: 'ecdsa'
+              ethOperationHash:
+                summary: Sign ETH operation hash (account-based)
+                value:
+                  pub: 'xpub9876543210zyxwvuZYXWVU...'
+                  source: 'user'
+                  signablePayload: '0x8a3f7c9e...'
+                  algorithm: 'ecdsa'
+      responses:
+        '200':
+          description: Transaction or message signed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignResponse'
+              examples:
+                btcSigned:
+                  summary: Signed BTC transaction
+                  value:
+                    signature: '020000...'
+                ethSigned:
+                  summary: Signed ETH operation (r, s, v format)
+                  value:
+                    signature: '0x1a10d7ee...'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: Private key not found for the given pub and source
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                message: 'Entry with pub xpub1234567890abcdefABCDEF... and source user not found in database'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /key/generate:
+    post:
+      tags:
+        - Key Management
+      summary: Generate a key pair
+      description: |
+        Generate a new key pair in your KMS/HSM provider for multisig wallets.
+
+        **Request:**
+        - `coin`: Coin identifier (e.g., "tbtc", "hteth")
+        - `source`: Key source (`user` or `backup`)
+        - `type`: Key type (`independent` or `tss`)
+
+        **Response:**
+        - `pub`: Public key (format varies by coin)
+        - `coin`: Coin identifier
+        - `source`: Key source
+        - `type`: Key type
+      operationId: generateKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateKeyRequest'
+            examples:
+              btcUserKey:
+                summary: Generate BTC user key
+                value:
+                  coin: 'tbtc'
+                  source: 'user'
+                  type: 'independent'
+              ethBackupKey:
+                summary: Generate ETH backup key
+                value:
+                  coin: 'hteth'
+                  source: 'backup'
+                  type: 'independent'
+      responses:
+        '200':
+          description: Key pair generated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerateKeyResponse'
+              examples:
+                btcKey:
+                  summary: BTC key generated
+                  value:
+                    pub: 'xpub1234567890abcdefABCDEF...'
+                    coin: 'tbtc'
+                    source: 'user'
+                    type: 'independent'
+                ethKey:
+                  summary: ETH key generated
+                  value:
+                    pub: 'xpub9876543210zyxwvuZYXWVU...'
+                    coin: 'hteth'
+                    source: 'backup'
+                    type: 'independent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Duplicate key - entry with same pub, source, and coin already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                message: 'Key with pub xpub1234567890abcdefABCDEF... and source user already exists for coin tbtc'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /generateDataKey:
+    post:
+      tags:
+        - Data Keys
+      summary: Generate a data encryption key
+      description: |
+        Generate a new data encryption key for envelope encryption operations.
+
+        The KMS/HSM provider generates a symmetric key and returns both:
+        - **plaintextKey**: Use immediately for encryption, then discard
+        - **encryptedKey**: Store this to decrypt data later using `/decryptDataKey`
+
+        This follows the envelope encryption pattern where data is encrypted with the data key,
+        and the data key itself is encrypted with the root key.
+      operationId: generateDataKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateDataKeyRequest'
+            examples:
+              aes256:
+                summary: Generate AES-256 key
+                value:
+                  keyType: 'AES-256'
+              rsa2048:
+                summary: Generate RSA-2048 key
+                value:
+                  keyType: 'RSA-2048'
+      responses:
+        '200':
+          description: Data key generated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerateDataKeyResponse'
+              example:
+                plaintextKey: '1,2,3,0,120,222,140,157,217,111,195,208,47,200,213,217,82,189,16,171,207,16,138,46,228,224,190,138,63,132,239,80,164,8,124,105,140,1,174,211,14,152,144,66,115,54,226,169,178,37,100,105,154,15,0,0,0,126,48,124,6,9,42,134,72,134,247,13,1,7,6,160,111,48,109,2,1,0,48,104,6,9,42,134,72,134,247,13,1,7,1,48,30,6,9,96,134,72,1,101,3,4,1,46,48,17,4,12,247,0,189,155,147,80,121,250,71,64,30,121,2,1,16,128,59,175,44,60,80,240,109,12,47,202,7,20,250,186,219,247,41,129,85,0,16,202,62,33,42,240,91,175,106,165,120,107,65,28,21,122,211,235,23,79,65,25,56,107,106,95,112,39,148,183,6,160,119,205,12,116,187,127,63,83'
+                encryptedKey: '62,137,108,179,93,237,135,139,245,68,225,226,124,238,181,134,151,103,246,23,4,9,186,197,223,50,53,196,52,94,22,16'
+        '409':
+          description: Database conflict - generated another root key for the same provider
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /decryptDataKey:
+    post:
+      tags:
+        - Data Keys
+      summary: Decrypt a data encryption key
+      description: |
+        Decrypt a previously generated data encryption key.
+
+        Provide the `encryptedKey` value that was returned from `/generateDataKey`.
+        The KMS/HSM provider decrypts it and returns the plaintext key.
+
+        Use the plaintext key for decryption operations, then discard it immediately.
+      operationId: decryptDataKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DecryptDataKeyRequest'
+            example:
+              encryptedKey: '62,137,108,179,93,237,135,139,245,68,225,226,124,238,181,134,151,103,246,23,4,9,186,197,223,50,53,196,52,94,22,16'
+      responses:
+        '200':
+          description: Data key decrypted successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DecryptDataKeyResponse'
+              example:
+                plaintextKey: '1,2,3,0,120,222,140,157,217,111,195,208,47,200,213,217,82,189,16,171,207,16,138,46,228,224,190,138,63,132,239,80,164,8,124,105,140,1,174,211,14,152,144,66,115,54,226,169,178,37,100,105,154,15,0,0,0,126,48,124,6,9,42,134,72,134,247,13,1,7,6,160,111,48,109,2,1,0,48,104,6,9,42,134,72,134,247,13,1,7,1,48,30,6,9,96,134,72,1,101,3,4,1,46,48,17,4,12,247,0,189,155,147,80,121,250,71,64,30,121,2,1,16,128,59,175,44,60,80,240,109,12,47,202,7,20,250,186,219,247,41,129,85,0,16,202,62,33,42,240,91,175,106,165,120,107,65,28,21,122,211,235,23,79,65,25,56,107,106,95,112,39,148,183,6,160,119,205,12,116,187,127,63,83'
+        '404':
+          description: Encrypted key not found or root key not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                message: 'Internal server error. Failed to fetch root key from database'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /openapi.json:
+    get:
+      tags:
+        - Documentation
+      summary: Get OpenAPI specification
+      description: |
+        Returns the OpenAPI specification in JSON format.
+
+        This endpoint is optional but recommended for clients to provide access to the API specification.
+      operationId: getOpenApiSpec
+      responses:
+        '200':
+          description: OpenAPI specification
+          content:
+            application/json:
+              schema:
+                type: object
+
+components:
+  schemas:
+    KeySource:
+      type: string
+      enum:
+        - user
+        - backup
+      description: |
+        The key source type:
+        - `user`: Keys used for transaction signing
+        - `backup`: Keys used for wallet recovery
+
+    KeyType:
+      type: string
+      enum:
+        - independent
+        - tss
+      description: |
+        The key type:
+        - `independent`: Standard single-signature keys
+        - `tss`: Threshold Signature Scheme (multi-party computation) keys
+
+    DataKeyType:
+      type: string
+      enum:
+        - AES-256
+        - RSA-2048
+        - ECDSA-P256
+      description: |
+        The encryption algorithm for data key generation:
+        - `AES-256`: 256-bit Advanced Encryption Standard
+        - `RSA-2048`: 2048-bit RSA
+        - `ECDSA-P256`: Elliptic Curve Digital Signature Algorithm with P-256 curve
+
+    StoreKeyRequest:
+      type: object
+      required:
+        - prv
+        - pub
+        - coin
+        - source
+        - type
+      properties:
+        prv:
+          type: string
+          description: The private key to be encrypted and stored
+          minLength: 1
+        pub:
+          type: string
+          description: The corresponding public key (used as identifier)
+          minLength: 1
+        coin:
+          type: string
+          description: The coin/blockchain type (e.g., "btc", "eth", "sol")
+          minLength: 1
+          example: 'sol'
+        source:
+          $ref: '#/components/schemas/KeySource'
+        type:
+          $ref: '#/components/schemas/KeyType'
+
+    StoreKeyResponse:
+      type: object
+      required:
+        - pub
+        - coin
+        - source
+        - type
+      properties:
+        pub:
+          type: string
+          description: The public key
+        coin:
+          type: string
+          description: The coin type
+        source:
+          $ref: '#/components/schemas/KeySource'
+        type:
+          $ref: '#/components/schemas/KeyType'
+
+    GetKeyResponse:
+      type: object
+      required:
+        - prv
+        - pub
+        - source
+        - type
+      properties:
+        prv:
+          type: string
+          description: The decrypted private key
+        pub:
+          type: string
+          description: The public key
+        source:
+          $ref: '#/components/schemas/KeySource'
+        type:
+          $ref: '#/components/schemas/KeyType'
+
+    SigningAlgorithm:
+      type: string
+      enum:
+        - ecdsa
+        - eddsa
+      description: |
+        The signing algorithm to use:
+        - `ecdsa`: Elliptic Curve Digital Signature Algorithm
+        - `eddsa`: Edwards-curve Digital Signature Algorithm
+
+    SignRequest:
+      type: object
+      required:
+        - pub
+        - source
+        - signablePayload
+        - algorithm
+      properties:
+        pub:
+          type: string
+          description: The public key identifying which private key to use for signing
+          minLength: 1
+          example: 'xpub9876543210zyxwvuZYXWVU...'
+        source:
+          $ref: '#/components/schemas/KeySource'
+        signablePayload:
+          type: string
+          description: |
+            The data to be signed. Format depends on coin type:
+            - **UTXO coins** (BTC, LTC): Unsigned PSBT hex (e.g., '70736274ff01007d02000000...')
+            - **Account-based coins** (ETH, Polygon): Operation hash with 0x prefix (e.g., '0x8a3f7c9e2b4d1a6f...')
+          minLength: 1
+        algorithm:
+          $ref: '#/components/schemas/SigningAlgorithm'
+
+    SignResponse:
+      type: object
+      required:
+        - signature
+      properties:
+        signature:
+          type: string
+          description: |
+            The signature. Format depends on coin type:
+            - **UTXO coins**: Signed PSBT hex or final transaction hex
+            - **Account-based coins**: Ethereum-format signature `0x{r}{s}{v}` (65 bytes, 130 hex chars + prefix)
+            - **EdDSA coins**: EdDSA signature in hex format
+          example: '0x1a10d7eecc7f7ad9c627218639d56a36ebd723767c974bff1cd70aa1a4c288a15cdb8cdb9ae01243b2b6353bf3a2a1aa412d7d0a1435dfbecd3156acd22d229a1b'
+
+    GenerateKeyRequest:
+      type: object
+      required:
+        - coin
+        - source
+        - type
+      properties:
+        coin:
+          type: string
+          description: The coin/blockchain type (e.g., "tbtc", "hteth")
+          minLength: 1
+          example: 'hteth'
+        source:
+          $ref: '#/components/schemas/KeySource'
+        type:
+          $ref: '#/components/schemas/KeyType'
+
+    GenerateKeyResponse:
+      type: object
+      required:
+        - pub
+        - coin
+        - source
+        - type
+      properties:
+        pub:
+          type: string
+          description: |
+            The generated public key. Format depends on coin type:
+            - **UTXO/Account-based coins**: Extended public key in BIP32 format (xpub...)
+            - **EdDSA coins**: Base58-encoded public key or extended public key format
+          example: 'xpub9876543210zyxwvuZYXWVU...'
+        coin:
+          type: string
+          description: The coin type
+          example: 'hteth'
+        source:
+          $ref: '#/components/schemas/KeySource'
+        type:
+          $ref: '#/components/schemas/KeyType'
+
+    GenerateDataKeyRequest:
+      type: object
+      required:
+        - keyType
+      properties:
+        keyType:
+          $ref: '#/components/schemas/DataKeyType'
+
+    GenerateDataKeyResponse:
+      type: object
+      required:
+        - plaintextKey
+        - encryptedKey
+      properties:
+        plaintextKey:
+          type: string
+          description: |
+            The data key in plaintext (comma-separated byte array as string).
+            Use immediately for encryption operations, then discard.
+        encryptedKey:
+          type: string
+          description: |
+            Encrypted data key or provider identifier (comma-separated byte array as string).
+            Store this value to decrypt data later using /decryptDataKey.
+
+    DecryptDataKeyRequest:
+      type: object
+      required:
+        - encryptedKey
+      properties:
+        encryptedKey:
+          type: string
+          description: The encrypted key or identifier from /generateDataKey
+
+    DecryptDataKeyResponse:
+      type: object
+      required:
+        - plaintextKey
+      properties:
+        plaintextKey:
+          type: string
+          description: |
+            The decrypted data key in plaintext (comma-separated byte array as string).
+            Use for decryption operations, then discard immediately.
+
+    ErrorResponse:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          type: string
+          description: Human-readable error message describing what went wrong
+
+  responses:
+    BadRequest:
+      description: Invalid request data or schema validation failure
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            message: 'Invalid data provided from client: keyType must be one of [AES-256, RSA-2048, ECDSA-P256]'
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            message: 'Entry with pub MIGeMA0GCSqGSIb3DQEBAQUAA4... and source user not found in database'
+
+    InternalServerError:
+      description: Internal server error or key provider operation failure
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            keyProviderFailure:
+              summary: key provider operation failed
+              value:
+                message: 'Failed to encrypt private key. AWS KMS returned InvalidKeyId'
+            databaseFailure:
+              summary: Database operation failed
+              value:
+                message: 'Internal server error. Failed to fetch or create root key from database'

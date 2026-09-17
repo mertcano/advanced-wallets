@@ -1,0 +1,2559 @@
+import 'should';
+import assert from 'assert';
+
+import * as request from 'supertest';
+import nock from 'nock';
+import sinon from 'sinon';
+import { app as expressApp } from '../../../masterBitGoExpressApp';
+import { AppMode, MasterExpressConfig, TlsMode } from '../../../shared/types';
+import { BitgoMpcGpgPubKeys, Environments } from '@bitgo-beta/sdk-core';
+import { BitGoAPI } from '@bitgo-beta/sdk-api';
+import * as middleware from '../../../shared/middleware';
+import { BitGoRequest } from '../../../types/request';
+import { BitGoAPITestHarness, DEFAULT_ASYNC_MODE_CONFIG } from './testUtils';
+
+function mockWalletResponse(id: string, coinName: string, overrides: Record<string, unknown> = {}) {
+  return {
+    id,
+    users: [{ user: 'user-id', permissions: ['admin', 'spend', 'view'] }],
+    coin: coinName,
+    label: 'test_wallet',
+    m: 2,
+    n: 3,
+    keys: ['user-key-id', 'backup-key-id', 'bitgo-key-id'],
+    keySignatures: {},
+    enterprise: 'test_enterprise',
+    organization: 'org-id',
+    bitgoOrg: 'BitGo Inc',
+    tags: [id, 'test_enterprise'],
+    disableTransactionNotifications: false,
+    freeze: {},
+    deleted: false,
+    approvalsRequired: 1,
+    isCold: false,
+    coinSpecific: {},
+    admin: {},
+    allowBackupKeySigning: false,
+    clientFlags: [],
+    recoverable: false,
+    startDate: '2025-01-01T00:00:00.000Z',
+    hasLargeNumberOfAddresses: false,
+    config: {},
+    balanceString: '0',
+    confirmedBalanceString: '0',
+    spendableBalanceString: '0',
+    receiveAddress: {
+      id: 'addr-id',
+      address: '0xexampleaddress',
+      chain: 0,
+      index: 0,
+      coin: coinName,
+      wallet: id,
+      coinSpecific: {},
+    },
+    ...overrides,
+  };
+}
+
+describe('POST /api/v1/:coin/advancedwallet/generate', () => {
+  let agent: request.SuperAgentTest;
+  const advancedWalletManagerUrl = 'http://advancedwalletmanager.invalid';
+  const bitgoApiUrl = Environments.test.uri;
+  const coin = 'tbtc';
+  const eddsaCoin = 'tsol';
+  const ecdsaCoin = 'hteth';
+  const accessToken = 'test-token';
+
+  // The SDK parses BitGo's GPG keys and rejects anything that is not a known BitGo MPC key
+  const bitgoMpcv1GpgKey = BitgoMpcGpgPubKeys.getBitgoMpcGpgPubKey('test', 'onprem', 'mpcv1');
+  const bitgoMpcv2GpgKey = BitgoMpcGpgPubKeys.getBitgoMpcGpgPubKey('test', 'onprem', 'mpcv2');
+
+  // Valid BIP32 extended public keys required by the SDK's isValidPub check
+  const validUserPub =
+    'xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8';
+  const validBackupPub =
+    'xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUKJyuyu5F1rzYGVxyL6tmgBUAEPrEz92mBXjByMRiJdba9wpnN37RLLAXa';
+
+  let bitgo: BitGoAPI;
+
+  function makeConfig(overrides: Partial<MasterExpressConfig> = {}): MasterExpressConfig {
+    return {
+      appMode: AppMode.MASTER_EXPRESS,
+      port: 0,
+      bind: 'localhost',
+      timeout: 60000,
+      httpLoggerFile: '',
+      env: 'test',
+      disableEnvCheck: true,
+      authVersion: 2,
+      advancedWalletManagerUrl: advancedWalletManagerUrl,
+      awmServerCaCert: 'dummy-cert',
+      tlsMode: TlsMode.DISABLED,
+      clientCertAllowSelfSigned: true,
+      asyncModeConfig: DEFAULT_ASYNC_MODE_CONFIG,
+      ...overrides,
+    };
+  }
+
+  before(() => {
+    nock.disableNetConnect();
+    nock.enableNetConnect('127.0.0.1');
+
+    bitgo = new BitGoAPI({ env: 'test' });
+
+    const config = makeConfig();
+
+    // Setup middleware stubs before creating app
+    sinon.stub(middleware, 'prepareBitGo').callsFake(() => (req, res, next) => {
+      (req as BitGoRequest<MasterExpressConfig>).bitgo = bitgo;
+      (req as BitGoRequest<MasterExpressConfig>).config = config;
+      next();
+    });
+
+    const app = expressApp(config);
+    agent = request.agent(app);
+  });
+
+  afterEach(() => {
+    nock.cleanAll();
+    sinon.restore();
+    BitGoAPITestHarness.clearConstantsCache();
+  });
+
+  it('should generate an onchain wallet with separate backup AWM (separate-HSM mode)', async () => {
+    const backupAwmUrl = 'http://backup-awm.invalid';
+
+    sinon.restore();
+    const backupBitgo = new BitGoAPI({ env: 'test' });
+    const configWithBackup = makeConfig({ advancedWalletManagerBackupUrl: backupAwmUrl });
+
+    sinon.stub(middleware, 'prepareBitGo').callsFake(() => (req, res, next) => {
+      (req as BitGoRequest<MasterExpressConfig>).bitgo = backupBitgo;
+      (req as BitGoRequest<MasterExpressConfig>).config = configWithBackup;
+      next();
+    });
+
+    const app = expressApp(configWithBackup);
+    const backupAgent = request.agent(app);
+
+    // User keychain goes to primary AWM
+    const userKeychainNock = nock(advancedWalletManagerUrl)
+      .post(`/api/${coin}/key/independent`, {
+        source: 'user',
+      })
+      .reply(200, {
+        pub: validUserPub,
+        source: 'user',
+        type: 'independent',
+      });
+
+    // Backup keychain goes to backup AWM
+    const backupKeychainNock = nock(backupAwmUrl)
+      .post(`/api/${coin}/key/independent`, {
+        source: 'backup',
+      })
+      .reply(200, {
+        pub: validBackupPub,
+        source: 'backup',
+        type: 'independent',
+      });
+
+    const bitgoAddUserKeyNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${coin}/key`, {
+        pub: validUserPub,
+        keyType: 'independent',
+        source: 'user',
+      })
+      .matchHeader('any', () => true)
+      .reply(200, { id: 'user-key-id', pub: validUserPub, source: 'user', type: 'independent' });
+
+    const bitgoAddBackupKeyNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${coin}/key`, {
+        pub: validBackupPub,
+        keyType: 'independent',
+        source: 'backup',
+      })
+      .matchHeader('any', () => true)
+      .reply(200, {
+        id: 'backup-key-id',
+        pub: validBackupPub,
+        source: 'backup',
+        type: 'independent',
+      });
+
+    const bitgoAddBitGoKeyNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${coin}/key`, {
+        source: 'bitgo',
+        enterprise: 'test_enterprise',
+      })
+      .reply(200, {
+        id: 'bitgo-key-id',
+        pub: 'xpub_bitgo',
+        source: 'bitgo',
+        type: 'independent',
+        isBitGo: true,
+        isTrust: false,
+        hsmType: 'institutional',
+      });
+
+    const bitgoAddWalletNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${coin}/wallet/add`)
+      .matchHeader('any', () => true)
+      .reply(
+        200,
+        mockWalletResponse('new-wallet-id', coin, {
+          isCold: true,
+          pendingApprovals: [],
+          multisigType: 'onchain',
+          type: 'advanced',
+        }),
+      );
+
+    const response = await backupAgent
+      .post(`/api/v1/${coin}/advancedwallet/generate`)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({
+        label: 'test_wallet',
+        enterprise: 'test_enterprise',
+        multisigType: 'onchain',
+      });
+
+    response.status.should.equal(200);
+    response.body.should.have.property('wallet');
+
+    // Verify user keychain went to primary AWM
+    userKeychainNock.done();
+    // Verify backup keychain went to backup AWM (separate HSM)
+    backupKeychainNock.done();
+    bitgoAddUserKeyNock.done();
+    bitgoAddBackupKeyNock.done();
+    bitgoAddBitGoKeyNock.done();
+    bitgoAddWalletNock.done();
+  });
+
+  it('should generate a wallet by calling the advanced wallet manager service', async () => {
+    const userKeychainNock = nock(advancedWalletManagerUrl)
+      .post(`/api/${coin}/key/independent`, {
+        source: 'user',
+      })
+      .reply(200, {
+        pub: validUserPub,
+        source: 'user',
+        type: 'independent',
+      });
+
+    const backupKeychainNock = nock(advancedWalletManagerUrl)
+      .post(`/api/${coin}/key/independent`, {
+        source: 'backup',
+      })
+      .reply(200, {
+        pub: validBackupPub,
+        source: 'backup',
+        type: 'independent',
+      });
+
+    const bitgoAddUserKeyNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${coin}/key`, {
+        pub: validUserPub,
+        keyType: 'independent',
+        source: 'user',
+      })
+      .matchHeader('any', () => true)
+      .reply(200, { id: 'user-key-id', pub: validUserPub, source: 'user', type: 'independent' });
+
+    const bitgoAddBackupKeyNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${coin}/key`, {
+        pub: validBackupPub,
+        keyType: 'independent',
+        source: 'backup',
+      })
+      .matchHeader('any', () => true)
+      .reply(200, {
+        id: 'backup-key-id',
+        pub: validBackupPub,
+        source: 'backup',
+        type: 'independent',
+      });
+
+    const bitgoAddBitGoKeyNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${coin}/key`, {
+        source: 'bitgo',
+        enterprise: 'test_enterprise',
+      })
+      .reply(200, {
+        id: 'bitgo-key-id',
+        pub: 'xpub_bitgo',
+        source: 'bitgo',
+        type: 'independent',
+        isBitGo: true,
+        isTrust: false,
+        hsmType: 'institutional',
+      });
+
+    const bitgoAddWalletNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${coin}/wallet/add`, {
+        label: 'test_wallet',
+        enterprise: 'test_enterprise',
+        m: 2,
+        n: 3,
+        keys: ['user-key-id', 'backup-key-id', 'bitgo-key-id'],
+        type: 'advanced',
+      })
+      .matchHeader('any', () => true)
+      .reply(
+        200,
+        mockWalletResponse('new-wallet-id', coin, {
+          isCold: true,
+          pendingApprovals: [],
+          receiveAddress: {
+            id: 'addr-id',
+            address: 'tb1qexampleaddress000000000000000000000',
+            chain: 20,
+            index: 0,
+            coin: coin,
+            wallet: 'new-wallet-id',
+            coinSpecific: {},
+          },
+          multisigType: 'onchain',
+          type: 'advanced',
+        }),
+      );
+
+    const response = await agent
+      .post(`/api/v1/${coin}/advancedwallet/generate`)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({
+        label: 'test_wallet',
+        enterprise: 'test_enterprise',
+        multisigType: 'onchain',
+      });
+
+    response.status.should.equal(200);
+    response.body.should.have.property('wallet');
+    response.body.wallet.should.have.properties({
+      id: 'new-wallet-id',
+      multisigType: 'onchain',
+      type: 'advanced',
+    });
+    response.body.should.have.propertyByPath('userKeychain', 'pub').eql(validUserPub);
+    response.body.should.have.propertyByPath('backupKeychain', 'pub').eql(validBackupPub);
+    response.body.should.have.propertyByPath('bitgoKeychain', 'pub').eql('xpub_bitgo');
+
+    userKeychainNock.done();
+    backupKeychainNock.done();
+    bitgoAddUserKeyNock.done();
+    bitgoAddBackupKeyNock.done();
+    bitgoAddBitGoKeyNock.done();
+    bitgoAddWalletNock.done();
+  });
+
+  it('should generate a TSS MPC v1 (EdDSA) wallet with separate backup AWM', async () => {
+    const backupAwmUrl = 'http://backup-awm.invalid';
+
+    sinon.restore();
+    // Register before new BitGoAPI() so the constructor's background fetchConstants() hits the nock;
+    // use persist() since the background fetch and the handler may both call the endpoint
+    nock(bitgoApiUrl)
+      .persist()
+      .get('/api/v1/client/constants')
+      .reply(200, { constants: { mpc: { bitgoPublicKey: bitgoMpcv1GpgKey } } });
+    const backupBitgo = new BitGoAPI({ env: 'test' });
+    const configWithBackup = makeConfig({ advancedWalletManagerBackupUrl: backupAwmUrl });
+
+    sinon.stub(middleware, 'prepareBitGo').callsFake(() => (req, res, next) => {
+      (req as BitGoRequest<MasterExpressConfig>).bitgo = backupBitgo;
+      (req as BitGoRequest<MasterExpressConfig>).config = configWithBackup;
+      next();
+    });
+
+    const app = expressApp(configWithBackup);
+    const backupAgent = request.agent(app);
+
+    // User init goes to primary AWM
+    const userInitNock = nock(advancedWalletManagerUrl)
+      .post(`/api/${eddsaCoin}/mpc/key/initialize`, {
+        source: 'user',
+        bitgoGpgPub: bitgoMpcv1GpgKey,
+      })
+      .reply(200, {
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        bitgoPayload: {
+          from: 'user',
+          to: 'bitgo',
+          publicShare: 'public-share-user',
+          privateShare: 'private-share-user-to-bitgo',
+          privateShareProof: 'proof',
+          vssProof: 'proof',
+          gpgKey: 'user-key',
+        },
+      });
+
+    // Backup init goes to backup AWM
+    const backupInitNock = nock(backupAwmUrl)
+      .post(`/api/${eddsaCoin}/mpc/key/initialize`, {
+        source: 'backup',
+        bitgoGpgPub: bitgoMpcv1GpgKey,
+        counterPartyGpgPub: 'user-key',
+      })
+      .reply(200, {
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        bitgoPayload: {
+          from: 'backup',
+          to: 'bitgo',
+          publicShare: 'public-share-backup',
+          privateShare: 'private-share-backup-to-bitgo',
+          privateShareProof: 'proof',
+          vssProof: 'proof',
+          gpgKey: 'backup-key',
+        },
+        counterPartyKeyShare: {
+          from: 'backup',
+          to: 'user',
+          publicShare: 'public-share-backup',
+          privateShare: 'private-share-backup-to-user',
+          privateShareProof: 'proof',
+          vssProof: 'proof',
+          gpgKey: 'backup-key',
+        },
+      });
+
+    const bitgoAddKeychainNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${eddsaCoin}/key`, {
+        keyType: 'tss',
+        source: 'bitgo',
+        enterprise: 'test_enterprise',
+        keyShares: [
+          {
+            from: 'user',
+            to: 'bitgo',
+            publicShare: 'public-share-user',
+            privateShare: 'private-share-user-to-bitgo',
+            privateShareProof: 'proof',
+            vssProof: 'proof',
+            gpgKey: 'user-key',
+          },
+          {
+            from: 'backup',
+            to: 'bitgo',
+            publicShare: 'public-share-backup',
+            privateShare: 'private-share-backup-to-bitgo',
+            privateShareProof: 'proof',
+            vssProof: 'proof',
+            gpgKey: 'backup-key',
+          },
+        ],
+        userGPGPublicKey: 'user-key',
+        backupGPGPublicKey: 'backup-key',
+      })
+      .reply(200, {
+        id: 'id',
+        source: 'bitgo',
+        type: 'tss',
+        commonKeychain: 'commonKeychain',
+        verifiedVssProof: true,
+        isBitGo: true,
+        isTrust: true,
+        hsmType: 'institutional',
+        keyShares: [
+          {
+            from: 'bitgo',
+            to: 'user',
+            publicShare: 'publicShare',
+            privateShare: 'privateShare',
+            vssProof: 'true',
+            gpgKey: 'bitgo-key',
+          },
+          {
+            from: 'bitgo',
+            to: 'backup',
+            publicShare: 'publicShare',
+            privateShare: 'privateShare',
+            vssProof: 'true',
+            gpgKey: 'bitgo-key',
+          },
+        ],
+        walletHSMGPGPublicKeySigs: 'hsm-sig',
+      });
+
+    // User finalize goes to primary AWM
+    const userFinalizeNock = nock(advancedWalletManagerUrl)
+      .post(`/api/${eddsaCoin}/mpc/key/finalize`, {
+        source: 'user',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        counterPartyGpgPub: 'backup-key',
+        bitgoKeyChain: {
+          id: 'id',
+          source: 'bitgo',
+          type: 'tss',
+          commonKeychain: 'commonKeychain',
+          verifiedVssProof: true,
+          isBitGo: true,
+          isTrust: false,
+          hsmType: 'institutional',
+          keyShares: [
+            {
+              from: 'bitgo',
+              to: 'user',
+              publicShare: 'publicShare',
+              privateShare: 'privateShare',
+              vssProof: 'true',
+              gpgKey: 'bitgo-key',
+            },
+            {
+              from: 'bitgo',
+              to: 'backup',
+              publicShare: 'publicShare',
+              privateShare: 'privateShare',
+              vssProof: 'true',
+              gpgKey: 'bitgo-key',
+            },
+          ],
+          walletHSMGPGPublicKeySigs: 'hsm-sig',
+        },
+        coin: 'tsol',
+        counterPartyKeyShare: {
+          from: 'backup',
+          to: 'user',
+          publicShare: 'public-share-backup',
+          privateShare: 'private-share-backup-to-user',
+          privateShareProof: 'proof',
+          vssProof: 'proof',
+          gpgKey: 'backup-key',
+        },
+      })
+      .reply(200, {
+        counterpartyKeyShare: {
+          from: 'user',
+          to: 'backup',
+          publicShare: 'publicShare',
+          privateShare: 'privateShare',
+          privateShareProof: 'privateShareProof',
+          vssProof: 'vssProof',
+          gpgKey: 'user-key',
+        },
+        source: 'user',
+        commonKeychain: 'commonKeychain',
+      });
+
+    const addUserKeyNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${eddsaCoin}/key`, {
+        commonKeychain: 'commonKeychain',
+        source: 'user',
+        keyType: 'tss',
+      })
+      .reply(200, {
+        id: 'user-key-id',
+        source: 'user',
+        type: 'tss',
+        commonKeychain: 'commonKeychain',
+      });
+
+    // Backup finalize goes to backup AWM
+    const backupFinalizeNock = nock(backupAwmUrl)
+      .post(`/api/${eddsaCoin}/mpc/key/finalize`, {
+        source: 'backup',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        counterPartyGpgPub: 'user-key',
+        bitgoKeyChain: {
+          id: 'id',
+          source: 'bitgo',
+          type: 'tss',
+          commonKeychain: 'commonKeychain',
+          verifiedVssProof: true,
+          isBitGo: true,
+          isTrust: false,
+          hsmType: 'institutional',
+          keyShares: [
+            {
+              from: 'bitgo',
+              to: 'user',
+              publicShare: 'publicShare',
+              privateShare: 'privateShare',
+              vssProof: 'true',
+              gpgKey: 'bitgo-key',
+            },
+            {
+              from: 'bitgo',
+              to: 'backup',
+              publicShare: 'publicShare',
+              privateShare: 'privateShare',
+              vssProof: 'true',
+              gpgKey: 'bitgo-key',
+            },
+          ],
+          walletHSMGPGPublicKeySigs: 'hsm-sig',
+        },
+        coin: 'tsol',
+        counterPartyKeyShare: {
+          from: 'user',
+          to: 'backup',
+          publicShare: 'publicShare',
+          privateShare: 'privateShare',
+          privateShareProof: 'privateShareProof',
+          vssProof: 'vssProof',
+          gpgKey: 'user-key',
+        },
+      })
+      .reply(200, {
+        source: 'backup',
+        commonKeychain: 'commonKeychain',
+      });
+
+    const addBackupKeyNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${eddsaCoin}/key`, {
+        source: 'backup',
+        keyType: 'tss',
+        commonKeychain: 'commonKeychain',
+      })
+      .reply(200, {
+        id: 'backup-key-id',
+        source: 'backup',
+        type: 'tss',
+        commonKeychain: 'commonKeychain',
+      });
+
+    const addWalletNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${eddsaCoin}/wallet/add`)
+      .matchHeader('any', () => true)
+      .reply(200, {
+        ...mockWalletResponse('wallet-id', eddsaCoin, {
+          multisigType: 'tss',
+          type: 'advanced',
+        }),
+      });
+
+    const response = await backupAgent
+      .post(`/api/v1/${eddsaCoin}/advancedwallet/generate`)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({
+        label: 'test_wallet',
+        enterprise: 'test_enterprise',
+        multisigType: 'tss',
+      });
+
+    response.status.should.equal(200);
+    response.body.should.have.property('wallet');
+
+    // Verify user operations went to primary AWM
+    userInitNock.done();
+    userFinalizeNock.done();
+    // Verify backup operations went to backup AWM
+    backupInitNock.done();
+    backupFinalizeNock.done();
+    // Verify BitGo API calls
+    bitgoAddKeychainNock.done();
+    addUserKeyNock.done();
+    addBackupKeyNock.done();
+    addWalletNock.done();
+  });
+
+  it('should generate a TSS MPC v1 wallet by calling the advanced wallet manager service', async () => {
+    nock(bitgoApiUrl)
+      .persist()
+      .get('/api/v1/client/constants')
+      .reply(200, { constants: { mpc: { bitgoPublicKey: bitgoMpcv1GpgKey } } });
+
+    const userInitNock = nock(advancedWalletManagerUrl)
+      .post(`/api/${eddsaCoin}/mpc/key/initialize`, {
+        source: 'user',
+        bitgoGpgPub: bitgoMpcv1GpgKey,
+      })
+      .reply(200, {
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        bitgoPayload: {
+          from: 'user',
+          to: 'bitgo',
+          publicShare: 'public-share-user',
+          privateShare: 'private-share-user-to-bitgo',
+          privateShareProof: 'proof',
+          vssProof: 'proof',
+          gpgKey: 'user-key',
+        },
+      });
+
+    const backupInitNock = nock(advancedWalletManagerUrl)
+      .post(`/api/${eddsaCoin}/mpc/key/initialize`, {
+        source: 'backup',
+        bitgoGpgPub: bitgoMpcv1GpgKey,
+        counterPartyGpgPub: 'user-key',
+      })
+      .reply(200, {
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        bitgoPayload: {
+          from: 'backup',
+          to: 'bitgo',
+          publicShare: 'public-share-backup',
+          privateShare: 'private-share-backup-to-bitgo',
+          privateShareProof: 'proof',
+          vssProof: 'proof',
+          gpgKey: 'backup-key',
+        },
+        counterPartyKeyShare: {
+          from: 'backup',
+          to: 'user',
+          publicShare: 'public-share-backup',
+          privateShare: 'private-share-backup-to-user',
+          privateShareProof: 'proof',
+          vssProof: 'proof',
+          gpgKey: 'backup-key',
+        },
+      });
+
+    const bitgoAddKeychainNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${eddsaCoin}/key`, {
+        keyType: 'tss',
+        source: 'bitgo',
+        enterprise: 'test_enterprise',
+        keyShares: [
+          {
+            from: 'user',
+            to: 'bitgo',
+            publicShare: 'public-share-user',
+            privateShare: 'private-share-user-to-bitgo',
+            privateShareProof: 'proof',
+            vssProof: 'proof',
+            gpgKey: 'user-key',
+          },
+          {
+            from: 'backup',
+            to: 'bitgo',
+            publicShare: 'public-share-backup',
+            privateShare: 'private-share-backup-to-bitgo',
+            privateShareProof: 'proof',
+            vssProof: 'proof',
+            gpgKey: 'backup-key',
+          },
+        ],
+        userGPGPublicKey: 'user-key',
+        backupGPGPublicKey: 'backup-key',
+      })
+      .reply(200, {
+        id: 'id',
+        source: 'bitgo',
+        type: 'tss',
+        commonKeychain: 'commonKeychain',
+        verifiedVssProof: true,
+        isBitGo: true,
+        isTrust: true,
+        hsmType: 'institutional',
+        keyShares: [
+          {
+            from: 'bitgo',
+            to: 'user',
+            publicShare: 'publicShare',
+            privateShare: 'privateShare',
+            vssProof: 'true',
+            gpgKey: 'bitgo-key',
+          },
+          {
+            from: 'bitgo',
+            to: 'backup',
+            publicShare: 'publicShare',
+            privateShare: 'privateShare',
+            vssProof: 'true',
+            gpgKey: 'bitgo-key',
+          },
+        ],
+        walletHSMGPGPublicKeySigs: 'hsm-sig',
+      });
+
+    const userFinalizeNock = nock(advancedWalletManagerUrl)
+      .post(`/api/${eddsaCoin}/mpc/key/finalize`, {
+        source: 'user',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        counterPartyGpgPub: 'backup-key',
+        bitgoKeyChain: {
+          id: 'id',
+          source: 'bitgo',
+          type: 'tss',
+          commonKeychain: 'commonKeychain',
+          verifiedVssProof: true,
+          isBitGo: true,
+          isTrust: false,
+          hsmType: 'institutional',
+          keyShares: [
+            {
+              from: 'bitgo',
+              to: 'user',
+              publicShare: 'publicShare',
+              privateShare: 'privateShare',
+              vssProof: 'true',
+              gpgKey: 'bitgo-key',
+            },
+            {
+              from: 'bitgo',
+              to: 'backup',
+              publicShare: 'publicShare',
+              privateShare: 'privateShare',
+              vssProof: 'true',
+              gpgKey: 'bitgo-key',
+            },
+          ],
+          walletHSMGPGPublicKeySigs: 'hsm-sig',
+        },
+        coin: 'tsol',
+        counterPartyKeyShare: {
+          from: 'backup',
+          to: 'user',
+          publicShare: 'public-share-backup',
+          privateShare: 'private-share-backup-to-user',
+          privateShareProof: 'proof',
+          vssProof: 'proof',
+          gpgKey: 'backup-key',
+        },
+      })
+      .reply(200, {
+        counterpartyKeyShare: {
+          from: 'user',
+          to: 'backup',
+          publicShare: 'publicShare',
+          privateShare: 'privateShare',
+          privateShareProof: 'privateShareProof',
+          vssProof: 'vssProof',
+          gpgKey: 'user-key',
+        },
+        source: 'user',
+        commonKeychain: 'commonKeychain',
+      });
+    const addUserKeyNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${eddsaCoin}/key`, {
+        commonKeychain: 'commonKeychain',
+        source: 'user',
+        keyType: 'tss',
+      })
+      .reply(200, {
+        id: 'id',
+        source: 'user',
+        type: 'tss',
+        commonKeychain: 'commonKeychain',
+      });
+    const backupFinalizeNock = nock(advancedWalletManagerUrl)
+      .post(`/api/${eddsaCoin}/mpc/key/finalize`, {
+        source: 'backup',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        counterPartyGpgPub: 'user-key',
+        bitgoKeyChain: {
+          id: 'id',
+          source: 'bitgo',
+          type: 'tss',
+          commonKeychain: 'commonKeychain',
+          verifiedVssProof: true,
+          isBitGo: true,
+          isTrust: false,
+          hsmType: 'institutional',
+          keyShares: [
+            {
+              from: 'bitgo',
+              to: 'user',
+              publicShare: 'publicShare',
+              privateShare: 'privateShare',
+              vssProof: 'true',
+              gpgKey: 'bitgo-key',
+            },
+            {
+              from: 'bitgo',
+              to: 'backup',
+              publicShare: 'publicShare',
+              privateShare: 'privateShare',
+              vssProof: 'true',
+              gpgKey: 'bitgo-key',
+            },
+          ],
+          walletHSMGPGPublicKeySigs: 'hsm-sig',
+        },
+        coin: 'tsol',
+        counterPartyKeyShare: {
+          from: 'user',
+          to: 'backup',
+          publicShare: 'publicShare',
+          privateShare: 'privateShare',
+          privateShareProof: 'privateShareProof',
+          vssProof: 'vssProof',
+          gpgKey: 'user-key',
+        },
+      })
+      .reply(200, {
+        source: 'backup',
+        commonKeychain: 'commonKeychain',
+      });
+
+    const addBackupKeyNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${eddsaCoin}/key`, {
+        source: 'backup',
+        keyType: 'tss',
+        commonKeychain: 'commonKeychain',
+      })
+      .reply(200, {
+        id: 'id',
+        source: 'backup',
+        type: 'tss',
+        commonKeychain: 'commonKeychain',
+      });
+
+    const addWalletNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${eddsaCoin}/wallet/add`, {
+        label: 'test_wallet',
+        enterprise: 'test_enterprise',
+        multisigType: 'tss',
+        m: 2,
+        n: 3,
+        keys: ['id', 'id', 'id'],
+        type: 'advanced',
+      })
+      .reply(200, {
+        id: 'wallet-id',
+        users: [
+          {
+            user: 'user-id',
+            permissions: ['admin', 'spend', 'view'],
+          },
+        ],
+        coin: eddsaCoin,
+        label: 'test_wallet',
+        m: 2,
+        n: 3,
+        keys: ['id', 'id', 'id'],
+        keySignatures: {},
+        enterprise: 'test_enterprise',
+        organization: 'org-id',
+        bitgoOrg: 'BitGo Inc',
+        tags: ['wallet-id', 'test_enterprise'],
+        disableTransactionNotifications: false,
+        freeze: {},
+        deleted: false,
+        approvalsRequired: 1,
+        isCold: true,
+        coinSpecific: {
+          rootAddress: '74AUHib3F6Fq5eVm2ywP5ik9iQjviwAfZXWnGM9JHhJ4',
+          pendingChainInitialization: true,
+          minimumFunding: 2447136,
+          lastChainIndex: ['Object'],
+          nonceExpiresAt: '2025-06-25T23:00:12.019Z',
+          trustedTokens: [],
+        },
+        admin: {},
+        pendingApprovals: [],
+        allowBackupKeySigning: false,
+        clientFlags: [],
+        walletFlags: [],
+        recoverable: false,
+        startDate: '2025-01-01T00:00:00.000Z',
+        hasLargeNumberOfAddresses: false,
+        config: {},
+        balanceString: '0',
+        confirmedBalanceString: '0',
+        spendableBalanceString: '0',
+        receiveAddress: {
+          id: 'addr-id',
+          address: '93AHaUAExampleRootAddress',
+          chain: 0,
+          index: 0,
+          coin: eddsaCoin,
+          wallet: 'wallet-id',
+          coinSpecific: {},
+        },
+        multisigType: 'tss',
+        type: 'advanced',
+      });
+
+    const response = await agent
+      .post(`/api/v1/${eddsaCoin}/advancedwallet/generate`)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({
+        label: 'test_wallet',
+        enterprise: 'test_enterprise',
+        multisigType: 'tss',
+      });
+
+    userInitNock.done();
+    backupInitNock.done();
+    bitgoAddKeychainNock.done();
+    userFinalizeNock.done();
+    addUserKeyNock.done();
+    backupFinalizeNock.done();
+    addBackupKeyNock.done();
+    addWalletNock.done();
+    response.status.should.equal(200);
+  });
+
+  it('should generate a TSS MPC v2 (ECDSA) wallet with separate backup AWM', async () => {
+    const backupAwmUrl = 'http://backup-awm.invalid';
+
+    sinon.restore();
+    // Register before new BitGoAPI() so the constructor's background fetchConstants() hits the nock;
+    // use persist() since the background fetch and the handler may both call the endpoint
+    nock(bitgoApiUrl)
+      .persist()
+      .get('/api/v1/client/constants')
+      .reply(200, { constants: { mpc: { bitgoMPCv2PublicKey: bitgoMpcv2GpgKey } } });
+    // The SDK resolves BitGo's MPCv2 GPG key and the enterprise's wallet creation settings itself
+    const tssPubkeyNock = nock(bitgoApiUrl)
+      .get(`/api/v2/${ecdsaCoin}/tss/pubkey`)
+      .query({ enterpriseId: 'test-enterprise' })
+      .reply(200, { mpcv2PublicKey: bitgoMpcv2GpgKey });
+
+    const tssSettingsNock = nock(bitgoApiUrl)
+      .get('/api/v2/tss/settings')
+      .query({ enterprise: 'test-enterprise' })
+      .reply(200, {
+        coinSettings: { eth: { walletCreationSettings: { multiSigTypeVersion: 'MPCv2' } } },
+      });
+    const backupBitgo = new BitGoAPI({ env: 'test' });
+    const configWithBackup = makeConfig({ advancedWalletManagerBackupUrl: backupAwmUrl });
+
+    sinon.stub(middleware, 'prepareBitGo').callsFake(() => (req, res, next) => {
+      (req as BitGoRequest<MasterExpressConfig>).bitgo = backupBitgo;
+      (req as BitGoRequest<MasterExpressConfig>).config = configWithBackup;
+      next();
+    });
+
+    const app = expressApp(configWithBackup);
+    const backupAgent = request.agent(app);
+
+    // Init: user goes to primary AWM, backup goes to backup AWM
+    const userInitNock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/initialize`, { source: 'user' })
+      .reply(200, {
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        gpgPub: 'test-user-public-key',
+      });
+
+    const backupInitNock = nock(backupAwmUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/initialize`, { source: 'backup' })
+      .reply(200, {
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        gpgPub: 'test-backup-public-key',
+      });
+
+    // Round 1: user goes to primary, backup goes to backup AWM
+    const userRound1Nock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/round`, {
+        source: 'user',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        round: 1,
+        bitgoGpgPub: bitgoMpcv2GpgKey,
+        counterPartyGpgPub: 'test-backup-public-key',
+      })
+      .reply(200, {
+        round: 2,
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        broadcastMessage: {
+          from: 0,
+          payload: { message: 'test-broadcast-message-user-1', signature: 'test-signature-user-1' },
+        },
+      });
+
+    const backupRound1Nock = nock(backupAwmUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/round`, {
+        source: 'backup',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        round: 1,
+        bitgoGpgPub: bitgoMpcv2GpgKey,
+        counterPartyGpgPub: 'test-user-public-key',
+      })
+      .reply(200, {
+        round: 2,
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        broadcastMessage: {
+          from: 1,
+          payload: {
+            message: 'test-broadcast-message-backup-1',
+            signature: 'test-signature-backup-1',
+          },
+        },
+      });
+
+    // BitGo round 1 & 2
+    const bitgoRound1And2Nock = nock(bitgoApiUrl)
+      .post(`/api/v2/mpc/generatekey`, {
+        enterprise: 'test-enterprise',
+        type: 'MPCv2',
+        round: 'MPCv2-R1',
+        payload: {
+          userGpgPublicKey: 'test-user-public-key',
+          backupGpgPublicKey: 'test-backup-public-key',
+          userMsg1: {
+            from: 0,
+            message: 'test-broadcast-message-user-1',
+            signature: 'test-signature-user-1',
+          },
+          backupMsg1: {
+            from: 1,
+            message: 'test-broadcast-message-backup-1',
+            signature: 'test-signature-backup-1',
+          },
+          walletId: undefined,
+        },
+      })
+      .reply(200, {
+        walletGpgPubKeySigs: 'test-wallet-gpg-pub-key-sigs',
+        sessionId: 'test-session-id',
+        bitgoMsg1: {
+          from: 2,
+          message: 'test-broadcast-message-bitgo-1',
+          signature: 'test-signature-bitgo-1',
+        },
+        bitgoToUserMsg2: {
+          from: 2,
+          to: 0,
+          encryptedMessage: 'test-p2p-message-bitgo-to-user-2',
+          signature: 'test-signature-bitgo-to-user-2',
+        },
+        bitgoToBackupMsg2: {
+          from: 2,
+          to: 1,
+          encryptedMessage: 'test-p2p-message-bitgo-to-backup-2',
+          signature: 'test-signature-bitgo-to-backup-2',
+        },
+      });
+
+    // Round 2: user to primary, backup to backup AWM
+    const userRound2Nock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/round`, {
+        source: 'user',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        round: 2,
+        broadcastMessages: {
+          bitgo: {
+            from: 2,
+            payload: {
+              message: 'test-broadcast-message-bitgo-1',
+              signature: 'test-signature-bitgo-1',
+            },
+          },
+          counterParty: {
+            from: 1,
+            payload: {
+              message: 'test-broadcast-message-backup-1',
+              signature: 'test-signature-backup-1',
+            },
+          },
+        },
+      })
+      .reply(200, {
+        round: 3,
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        p2pMessages: {
+          bitgo: {
+            from: 0,
+            to: 2,
+            payload: {
+              encryptedMessage: 'test-p2p-message-user-to-bitgo-2',
+              signature: 'test-signature-user-to-bitgo-2',
+            },
+            commitment: 'test-commitment-user-2',
+          },
+          counterParty: {
+            from: 0,
+            to: 1,
+            payload: {
+              encryptedMessage: 'test-p2p-message-user-to-backup-2',
+              signature: 'test-signature-user-to-backup-2',
+            },
+            commitment: 'test-commitment-user-2',
+          },
+        },
+      });
+
+    const backupRound2Nock = nock(backupAwmUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/round`, {
+        source: 'backup',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        round: 2,
+        broadcastMessages: {
+          bitgo: {
+            from: 2,
+            payload: {
+              message: 'test-broadcast-message-bitgo-1',
+              signature: 'test-signature-bitgo-1',
+            },
+          },
+          counterParty: {
+            from: 0,
+            payload: {
+              message: 'test-broadcast-message-user-1',
+              signature: 'test-signature-user-1',
+            },
+          },
+        },
+      })
+      .reply(200, {
+        round: 3,
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        p2pMessages: {
+          bitgo: {
+            from: 1,
+            to: 2,
+            payload: {
+              encryptedMessage: 'test-p2p-message-backup-to-bitgo-2',
+              signature: 'test-signature-backup-to-bitgo-2',
+            },
+            commitment: 'test-commitment-backup-2',
+          },
+          counterParty: {
+            from: 1,
+            to: 0,
+            payload: {
+              encryptedMessage: 'test-p2p-message-backup-to-user-2',
+              signature: 'test-signature-backup-to-user-2',
+            },
+            commitment: 'test-commitment-backup-2',
+          },
+        },
+      });
+
+    // Round 3: user to primary, backup to backup AWM
+    const userRound3Nock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/round`, {
+        source: 'user',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        round: 3,
+        p2pMessages: {
+          bitgo: {
+            from: 2,
+            to: 0,
+            payload: {
+              encryptedMessage: 'test-p2p-message-bitgo-to-user-2',
+              signature: 'test-signature-bitgo-to-user-2',
+            },
+          },
+          counterParty: {
+            from: 1,
+            to: 0,
+            payload: {
+              encryptedMessage: 'test-p2p-message-backup-to-user-2',
+              signature: 'test-signature-backup-to-user-2',
+            },
+            commitment: 'test-commitment-backup-2',
+          },
+        },
+      })
+      .reply(200, {
+        round: 4,
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        p2pMessages: {
+          bitgo: {
+            from: 0,
+            to: 2,
+            payload: {
+              encryptedMessage: 'test-p2p-message-user-to-bitgo-3',
+              signature: 'test-signature-user-to-bitgo-3',
+            },
+            commitment: 'test-commitment-user-3',
+          },
+          counterParty: {
+            from: 0,
+            to: 1,
+            payload: {
+              encryptedMessage: 'test-p2p-message-user-to-backup-3',
+              signature: 'test-signature-user-to-backup-3',
+            },
+            commitment: 'test-commitment-user-3',
+          },
+        },
+      });
+
+    const backupRound3Nock = nock(backupAwmUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/round`, {
+        source: 'backup',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        round: 3,
+        p2pMessages: {
+          bitgo: {
+            from: 2,
+            to: 1,
+            payload: {
+              encryptedMessage: 'test-p2p-message-bitgo-to-backup-2',
+              signature: 'test-signature-bitgo-to-backup-2',
+            },
+          },
+          counterParty: {
+            from: 0,
+            to: 1,
+            payload: {
+              encryptedMessage: 'test-p2p-message-user-to-backup-2',
+              signature: 'test-signature-user-to-backup-2',
+            },
+            commitment: 'test-commitment-user-2',
+          },
+        },
+      })
+      .reply(200, {
+        round: 4,
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        p2pMessages: {
+          bitgo: {
+            from: 1,
+            to: 2,
+            payload: {
+              encryptedMessage: 'test-p2p-message-backup-to-bitgo-3',
+              signature: 'test-signature-backup-to-bitgo-3',
+            },
+            commitment: 'test-commitment-backup-3',
+          },
+          counterParty: {
+            from: 1,
+            to: 0,
+            payload: {
+              encryptedMessage: 'test-p2p-message-backup-to-user-3',
+              signature: 'test-signature-backup-to-user-3',
+            },
+            commitment: 'test-commitment-backup-3',
+          },
+        },
+      });
+
+    // BitGo round 3
+    const bitgoRound3Nock = nock(bitgoApiUrl)
+      .post(`/api/v2/mpc/generatekey`, {
+        enterprise: 'test-enterprise',
+        type: 'MPCv2',
+        round: 'MPCv2-R2',
+        payload: {
+          sessionId: 'test-session-id',
+          userMsg2: {
+            from: 0,
+            to: 2,
+            encryptedMessage: 'test-p2p-message-user-to-bitgo-2',
+            signature: 'test-signature-user-to-bitgo-2',
+          },
+          userCommitment2: 'test-commitment-user-2',
+          backupMsg2: {
+            from: 1,
+            to: 2,
+            encryptedMessage: 'test-p2p-message-backup-to-bitgo-2',
+            signature: 'test-signature-backup-to-bitgo-2',
+          },
+          backupCommitment2: 'test-commitment-backup-2',
+        },
+      })
+      .reply(200, {
+        sessionId: 'test-session-id',
+        bitgoCommitment2: 'test-commitment-bitgo-2',
+        bitgoToUserMsg3: {
+          from: 2,
+          to: 0,
+          encryptedMessage: 'test-p2p-message-bitgo-to-user-3',
+          signature: 'test-signature-bitgo-to-user-3',
+        },
+        bitgoToBackupMsg3: {
+          from: 2,
+          to: 1,
+          encryptedMessage: 'test-p2p-message-bitgo-to-backup-3',
+          signature: 'test-signature-bitgo-to-backup-3',
+        },
+      });
+
+    // Round 4: user to primary, backup to backup AWM
+    const userRound4Nock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/round`, {
+        source: 'user',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        round: 4,
+        p2pMessages: {
+          bitgo: {
+            from: 2,
+            to: 0,
+            payload: {
+              encryptedMessage: 'test-p2p-message-bitgo-to-user-3',
+              signature: 'test-signature-bitgo-to-user-3',
+            },
+            commitment: 'test-commitment-bitgo-2',
+          },
+          counterParty: {
+            from: 1,
+            to: 0,
+            payload: {
+              encryptedMessage: 'test-p2p-message-backup-to-user-3',
+              signature: 'test-signature-backup-to-user-3',
+            },
+            commitment: 'test-commitment-backup-3',
+          },
+        },
+      })
+      .reply(200, {
+        round: 5,
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        broadcastMessage: {
+          from: 0,
+          payload: { message: 'test-broadcast-message-user-4', signature: 'test-signature-user-4' },
+        },
+      });
+
+    const backupRound4Nock = nock(backupAwmUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/round`, {
+        source: 'backup',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        round: 4,
+        p2pMessages: {
+          bitgo: {
+            from: 2,
+            to: 1,
+            payload: {
+              encryptedMessage: 'test-p2p-message-bitgo-to-backup-3',
+              signature: 'test-signature-bitgo-to-backup-3',
+            },
+            commitment: 'test-commitment-bitgo-2',
+          },
+          counterParty: {
+            from: 0,
+            to: 1,
+            payload: {
+              encryptedMessage: 'test-p2p-message-user-to-backup-3',
+              signature: 'test-signature-user-to-backup-3',
+            },
+            commitment: 'test-commitment-user-3',
+          },
+        },
+      })
+      .reply(200, {
+        round: 5,
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        broadcastMessage: {
+          from: 1,
+          payload: {
+            message: 'test-broadcast-message-backup-4',
+            signature: 'test-signature-backup-4',
+          },
+        },
+      });
+
+    // BitGo round 4
+    const bitgoRound4Nock = nock(bitgoApiUrl)
+      .post(`/api/v2/mpc/generatekey`, {
+        enterprise: 'test-enterprise',
+        type: 'MPCv2',
+        round: 'MPCv2-R3',
+        payload: {
+          sessionId: 'test-session-id',
+          userMsg3: {
+            from: 0,
+            to: 2,
+            encryptedMessage: 'test-p2p-message-user-to-bitgo-3',
+            signature: 'test-signature-user-to-bitgo-3',
+          },
+          backupMsg3: {
+            from: 1,
+            to: 2,
+            encryptedMessage: 'test-p2p-message-backup-to-bitgo-3',
+            signature: 'test-signature-backup-to-bitgo-3',
+          },
+          userMsg4: {
+            from: 0,
+            message: 'test-broadcast-message-user-4',
+            signature: 'test-signature-user-4',
+          },
+          backupMsg4: {
+            from: 1,
+            message: 'test-broadcast-message-backup-4',
+            signature: 'test-signature-backup-4',
+          },
+        },
+      })
+      .reply(200, {
+        sessionId: 'test-session-id',
+        commonKeychain: 'commonKeychain',
+        bitgoMsg4: {
+          from: 2,
+          message: 'test-broadcast-message-bitgo-4',
+          signature: 'test-signature-bitgo-4',
+        },
+      });
+
+    // Finalize: user to primary, backup to backup AWM
+    const userFinalizeNock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/finalize`, {
+        source: 'user',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        broadcastMessages: {
+          bitgo: {
+            from: 2,
+            payload: {
+              message: 'test-broadcast-message-bitgo-4',
+              signature: 'test-signature-bitgo-4',
+            },
+          },
+          counterParty: {
+            from: 1,
+            payload: {
+              message: 'test-broadcast-message-backup-4',
+              signature: 'test-signature-backup-4',
+            },
+          },
+        },
+        bitgoCommonKeychain: 'commonKeychain',
+      })
+      .reply(200, { source: 'user', commonKeychain: 'commonKeychain' });
+
+    const backupFinalizeNock = nock(backupAwmUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/finalize`, {
+        source: 'backup',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        broadcastMessages: {
+          bitgo: {
+            from: 2,
+            payload: {
+              message: 'test-broadcast-message-bitgo-4',
+              signature: 'test-signature-bitgo-4',
+            },
+          },
+          counterParty: {
+            from: 0,
+            payload: {
+              message: 'test-broadcast-message-user-4',
+              signature: 'test-signature-user-4',
+            },
+          },
+        },
+        bitgoCommonKeychain: 'commonKeychain',
+      })
+      .reply(200, { source: 'backup', commonKeychain: 'commonKeychain' });
+
+    // Key creation on BitGo
+    const bitgoAddUserKeyNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${ecdsaCoin}/key`, {
+        commonKeychain: 'commonKeychain',
+        source: 'user',
+        keyType: 'tss',
+        isMPCv2: true,
+      })
+      .reply(200, { id: 'user-key-id', source: 'user', type: 'tss' });
+
+    const bitgoAddBackupKeyNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${ecdsaCoin}/key`, {
+        commonKeychain: 'commonKeychain',
+        source: 'backup',
+        keyType: 'tss',
+        isMPCv2: true,
+      })
+      .reply(200, { id: 'backup-key-id', source: 'backup', type: 'tss' });
+
+    const bitgoAddBitGoKeyNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${ecdsaCoin}/key`, {
+        commonKeychain: 'commonKeychain',
+        source: 'bitgo',
+        keyType: 'tss',
+        isMPCv2: true,
+      })
+      .reply(200, {
+        id: 'bitgo-key-id',
+        source: 'bitgo',
+        type: 'tss',
+        commonKeychain: 'commonKeychain',
+        isBitGo: true,
+        isTrust: false,
+        hsmType: 'institutional',
+      });
+
+    const bitgoAddWalletNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${ecdsaCoin}/wallet/add`)
+      .matchHeader('any', () => true)
+      .reply(200, {
+        ...mockWalletResponse('new-wallet-id', ecdsaCoin, {
+          multisigType: 'tss',
+          type: 'advanced',
+        }),
+      });
+
+    const response = await backupAgent
+      .post(`/api/v1/${ecdsaCoin}/advancedwallet/generate`)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({
+        label: 'test-wallet',
+        enterprise: 'test-enterprise',
+        multisigType: 'tss',
+      });
+
+    response.status.should.equal(200);
+    response.body.should.have.property('wallet');
+
+    // Verify user operations went to primary AWM
+    userInitNock.done();
+    userRound1Nock.done();
+    userRound2Nock.done();
+    userRound3Nock.done();
+    userRound4Nock.done();
+    userFinalizeNock.done();
+    // Verify backup operations went to backup AWM
+    backupInitNock.done();
+    backupRound1Nock.done();
+    backupRound2Nock.done();
+    backupRound3Nock.done();
+    backupRound4Nock.done();
+    backupFinalizeNock.done();
+    // Verify BitGo API calls
+    tssPubkeyNock.done();
+    tssSettingsNock.done();
+    bitgoRound1And2Nock.done();
+    bitgoRound3Nock.done();
+    bitgoRound4Nock.done();
+    bitgoAddUserKeyNock.done();
+    bitgoAddBackupKeyNock.done();
+    bitgoAddBitGoKeyNock.done();
+    bitgoAddWalletNock.done();
+  });
+
+  it('should generate a TSS MPC v2 wallet by calling the advanced wallet manager service', async () => {
+    nock(bitgoApiUrl)
+      .persist()
+      .get('/api/v1/client/constants')
+      .reply(200, { constants: { mpc: { bitgoMPCv2PublicKey: bitgoMpcv2GpgKey } } });
+    // The SDK resolves BitGo's MPCv2 GPG key and the enterprise's wallet creation settings itself
+    const tssPubkeyNock = nock(bitgoApiUrl)
+      .get(`/api/v2/${ecdsaCoin}/tss/pubkey`)
+      .query({ enterpriseId: 'test-enterprise' })
+      .reply(200, { mpcv2PublicKey: bitgoMpcv2GpgKey });
+
+    const tssSettingsNock = nock(bitgoApiUrl)
+      .get('/api/v2/tss/settings')
+      .query({ enterprise: 'test-enterprise' })
+      .reply(200, {
+        coinSettings: { eth: { walletCreationSettings: { multiSigTypeVersion: 'MPCv2' } } },
+      });
+
+    // init round
+    const userInitNock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/initialize`, {
+        source: 'user',
+      })
+      .reply(200, {
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        gpgPub: 'test-user-public-key',
+      });
+
+    const backupInitNock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/initialize`, {
+        source: 'backup',
+      })
+      .reply(200, {
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        gpgPub: 'test-backup-public-key',
+      });
+
+    const userRound1Nock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/round`, {
+        source: 'user',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        round: 1,
+        bitgoGpgPub: bitgoMpcv2GpgKey,
+        counterPartyGpgPub: 'test-backup-public-key',
+      })
+      .reply(200, {
+        round: 2,
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        broadcastMessage: {
+          from: 0,
+          payload: {
+            message: 'test-broadcast-message-user-1',
+            signature: 'test-signature-user-1',
+          },
+        },
+      });
+
+    const backupRound1Nock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/round`, {
+        source: 'backup',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        round: 1,
+        bitgoGpgPub: bitgoMpcv2GpgKey,
+        counterPartyGpgPub: 'test-user-public-key',
+      })
+      .reply(200, {
+        round: 2,
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        broadcastMessage: {
+          from: 1,
+          payload: {
+            message: 'test-broadcast-message-backup-1',
+            signature: 'test-signature-backup-1',
+          },
+        },
+      });
+
+    const bitgoRound1And2Nock = nock(bitgoApiUrl)
+      .post(`/api/v2/mpc/generatekey`, {
+        enterprise: 'test-enterprise', // ?
+        type: 'MPCv2',
+        round: 'MPCv2-R1',
+        payload: {
+          userGpgPublicKey: 'test-user-public-key',
+          backupGpgPublicKey: 'test-backup-public-key',
+          userMsg1: {
+            from: 0,
+            message: 'test-broadcast-message-user-1',
+            signature: 'test-signature-user-1',
+          },
+          backupMsg1: {
+            from: 1,
+            message: 'test-broadcast-message-backup-1',
+            signature: 'test-signature-backup-1',
+          },
+          walletId: undefined,
+        },
+      })
+      .reply(200, {
+        walletGpgPubKeySigs: 'test-wallet-gpg-pub-key-sigs',
+        sessionId: 'test-session-id',
+        bitgoMsg1: {
+          from: 2,
+          message: 'test-broadcast-message-bitgo-1',
+          signature: 'test-signature-bitgo-1',
+        },
+        bitgoToUserMsg2: {
+          from: 2,
+          to: 0,
+          encryptedMessage: 'test-p2p-message-bitgo-to-user-2',
+          signature: 'test-signature-bitgo-to-user-2',
+        },
+        bitgoToBackupMsg2: {
+          from: 2,
+          to: 1,
+          encryptedMessage: 'test-p2p-message-bitgo-to-backup-2',
+          signature: 'test-signature-bitgo-to-backup-2',
+        },
+      });
+
+    const userRound2Nock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/round`, {
+        source: 'user',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        round: 2,
+        broadcastMessages: {
+          bitgo: {
+            from: 2,
+            payload: {
+              message: 'test-broadcast-message-bitgo-1',
+              signature: 'test-signature-bitgo-1',
+            },
+          },
+          counterParty: {
+            from: 1,
+            payload: {
+              message: 'test-broadcast-message-backup-1',
+              signature: 'test-signature-backup-1',
+            },
+          },
+        },
+      })
+      .reply(200, {
+        round: 3,
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        p2pMessages: {
+          bitgo: {
+            from: 0,
+            to: 2,
+            payload: {
+              encryptedMessage: 'test-p2p-message-user-to-bitgo-2',
+              signature: 'test-signature-user-to-bitgo-2',
+            },
+            commitment: 'test-commitment-user-2',
+          },
+          counterParty: {
+            from: 0,
+            to: 1,
+            payload: {
+              encryptedMessage: 'test-p2p-message-user-to-backup-2',
+              signature: 'test-signature-user-to-backup-2',
+            },
+            commitment: 'test-commitment-user-2',
+          },
+        },
+      });
+
+    const backupRound2Nock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/round`, {
+        source: 'backup',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        round: 2,
+        broadcastMessages: {
+          bitgo: {
+            from: 2,
+            payload: {
+              message: 'test-broadcast-message-bitgo-1',
+              signature: 'test-signature-bitgo-1',
+            },
+          },
+          counterParty: {
+            from: 0,
+            payload: {
+              message: 'test-broadcast-message-user-1',
+              signature: 'test-signature-user-1',
+            },
+          },
+        },
+      })
+      .reply(200, {
+        round: 3,
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        p2pMessages: {
+          bitgo: {
+            from: 1,
+            to: 2,
+            payload: {
+              encryptedMessage: 'test-p2p-message-backup-to-bitgo-2',
+              signature: 'test-signature-backup-to-bitgo-2',
+            },
+            commitment: 'test-commitment-backup-2',
+          },
+          counterParty: {
+            from: 1,
+            to: 0,
+            payload: {
+              encryptedMessage: 'test-p2p-message-backup-to-user-2',
+              signature: 'test-signature-backup-to-user-2',
+            },
+            commitment: 'test-commitment-backup-2',
+          },
+        },
+      });
+
+    const userRound3Nock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/round`, {
+        source: 'user',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        round: 3,
+        p2pMessages: {
+          bitgo: {
+            from: 2,
+            to: 0,
+            payload: {
+              encryptedMessage: 'test-p2p-message-bitgo-to-user-2',
+              signature: 'test-signature-bitgo-to-user-2',
+            },
+            // commitment: undefined,
+          },
+          counterParty: {
+            from: 1,
+            to: 0,
+            payload: {
+              encryptedMessage: 'test-p2p-message-backup-to-user-2',
+              signature: 'test-signature-backup-to-user-2',
+            },
+            commitment: 'test-commitment-backup-2',
+          },
+        },
+      })
+      .reply(200, {
+        round: 4,
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        p2pMessages: {
+          bitgo: {
+            from: 0,
+            to: 2,
+            payload: {
+              encryptedMessage: 'test-p2p-message-user-to-bitgo-3',
+              signature: 'test-signature-user-to-bitgo-3',
+            },
+            commitment: 'test-commitment-user-3',
+          },
+          counterParty: {
+            from: 0,
+            to: 1,
+            payload: {
+              encryptedMessage: 'test-p2p-message-user-to-backup-3',
+              signature: 'test-signature-user-to-backup-3',
+            },
+            commitment: 'test-commitment-user-3',
+          },
+        },
+      });
+
+    const backupRound3Nock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/round`, {
+        source: 'backup',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        round: 3,
+        p2pMessages: {
+          bitgo: {
+            from: 2,
+            to: 1,
+            payload: {
+              encryptedMessage: 'test-p2p-message-bitgo-to-backup-2',
+              signature: 'test-signature-bitgo-to-backup-2',
+            },
+            // commitment: undefined,
+          },
+          counterParty: {
+            from: 0,
+            to: 1,
+            payload: {
+              encryptedMessage: 'test-p2p-message-user-to-backup-2',
+              signature: 'test-signature-user-to-backup-2',
+            },
+            commitment: 'test-commitment-user-2',
+          },
+        },
+      })
+      .reply(200, {
+        round: 4,
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        p2pMessages: {
+          bitgo: {
+            from: 1,
+            to: 2,
+            payload: {
+              encryptedMessage: 'test-p2p-message-backup-to-bitgo-3',
+              signature: 'test-signature-backup-to-bitgo-3',
+            },
+            commitment: 'test-commitment-backup-3',
+          },
+          counterParty: {
+            from: 1,
+            to: 0,
+            payload: {
+              encryptedMessage: 'test-p2p-message-backup-to-user-3',
+              signature: 'test-signature-backup-to-user-3',
+            },
+            commitment: 'test-commitment-backup-3',
+          },
+        },
+      });
+
+    const bitgoRound3Nock = nock(bitgoApiUrl)
+      .post(`/api/v2/mpc/generatekey`, {
+        enterprise: 'test-enterprise',
+        type: 'MPCv2',
+        round: 'MPCv2-R2',
+        payload: {
+          sessionId: 'test-session-id',
+          userMsg2: {
+            from: 0,
+            to: 2,
+            encryptedMessage: 'test-p2p-message-user-to-bitgo-2',
+            signature: 'test-signature-user-to-bitgo-2',
+          },
+          userCommitment2: 'test-commitment-user-2',
+          backupMsg2: {
+            from: 1,
+            to: 2,
+            encryptedMessage: 'test-p2p-message-backup-to-bitgo-2',
+            signature: 'test-signature-backup-to-bitgo-2',
+          },
+          backupCommitment2: 'test-commitment-backup-2',
+        },
+      })
+      .reply(200, {
+        sessionId: 'test-session-id',
+        bitgoCommitment2: 'test-commitment-bitgo-2',
+        bitgoToUserMsg3: {
+          from: 2,
+          to: 0,
+          encryptedMessage: 'test-p2p-message-bitgo-to-user-3',
+          signature: 'test-signature-bitgo-to-user-3',
+        },
+        bitgoToBackupMsg3: {
+          from: 2,
+          to: 1,
+          encryptedMessage: 'test-p2p-message-bitgo-to-backup-3',
+          signature: 'test-signature-bitgo-to-backup-3',
+        },
+      });
+
+    const userRound4Nock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/round`, {
+        source: 'user',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        round: 4,
+        p2pMessages: {
+          bitgo: {
+            from: 2,
+            to: 0,
+            payload: {
+              encryptedMessage: 'test-p2p-message-bitgo-to-user-3',
+              signature: 'test-signature-bitgo-to-user-3',
+            },
+            commitment: 'test-commitment-bitgo-2', // not a typo
+          },
+          counterParty: {
+            from: 1,
+            to: 0,
+            payload: {
+              encryptedMessage: 'test-p2p-message-backup-to-user-3',
+              signature: 'test-signature-backup-to-user-3',
+            },
+            commitment: 'test-commitment-backup-3',
+          },
+        },
+      })
+      .reply(200, {
+        round: 5,
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        broadcastMessage: {
+          from: 0,
+          payload: {
+            message: 'test-broadcast-message-user-4',
+            signature: 'test-signature-user-4',
+          },
+        },
+      });
+
+    const backupRound4Nock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/round`, {
+        source: 'backup',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        round: 4,
+        p2pMessages: {
+          bitgo: {
+            from: 2,
+            to: 1,
+            payload: {
+              encryptedMessage: 'test-p2p-message-bitgo-to-backup-3',
+              signature: 'test-signature-bitgo-to-backup-3',
+            },
+            commitment: 'test-commitment-bitgo-2', // not a typo
+          },
+          counterParty: {
+            from: 0,
+            to: 1,
+            payload: {
+              encryptedMessage: 'test-p2p-message-user-to-backup-3',
+              signature: 'test-signature-user-to-backup-3',
+            },
+            commitment: 'test-commitment-user-3',
+          },
+        },
+      })
+      .reply(200, {
+        round: 5,
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        broadcastMessage: {
+          from: 1,
+          payload: {
+            message: 'test-broadcast-message-backup-4',
+            signature: 'test-signature-backup-4',
+          },
+        },
+      });
+
+    const bitgoRound4Nock = nock(bitgoApiUrl)
+      .post(`/api/v2/mpc/generatekey`, {
+        enterprise: 'test-enterprise',
+        type: 'MPCv2',
+        round: 'MPCv2-R3',
+        payload: {
+          sessionId: 'test-session-id',
+          userMsg3: {
+            from: 0,
+            to: 2,
+            encryptedMessage: 'test-p2p-message-user-to-bitgo-3',
+            signature: 'test-signature-user-to-bitgo-3',
+          },
+          backupMsg3: {
+            from: 1,
+            to: 2,
+            encryptedMessage: 'test-p2p-message-backup-to-bitgo-3',
+            signature: 'test-signature-backup-to-bitgo-3',
+          },
+          userMsg4: {
+            from: 0,
+            message: 'test-broadcast-message-user-4',
+            signature: 'test-signature-user-4',
+          },
+          backupMsg4: {
+            from: 1,
+            message: 'test-broadcast-message-backup-4',
+            signature: 'test-signature-backup-4',
+          },
+        },
+      })
+      .reply(200, {
+        sessionId: 'test-session-id',
+        commonKeychain: 'commonKeychain',
+        bitgoMsg4: {
+          from: 2,
+          message: 'test-broadcast-message-bitgo-4',
+          signature: 'test-signature-bitgo-4',
+        },
+      });
+
+    const userFinalizeNock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/finalize`, {
+        source: 'user',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        broadcastMessages: {
+          bitgo: {
+            from: 2,
+            payload: {
+              message: 'test-broadcast-message-bitgo-4',
+              signature: 'test-signature-bitgo-4',
+            },
+          },
+          counterParty: {
+            from: 1,
+            payload: {
+              message: 'test-broadcast-message-backup-4',
+              signature: 'test-signature-backup-4',
+            },
+          },
+        },
+        bitgoCommonKeychain: 'commonKeychain',
+      })
+      .reply(200, {
+        source: 'user',
+        commonKeychain: 'commonKeychain',
+      });
+
+    const backupFinalizeNock = nock(advancedWalletManagerUrl)
+      .post(`/api/${ecdsaCoin}/mpcv2/finalize`, {
+        source: 'backup',
+        encryptedDataKey: 'key',
+        encryptedData: 'data',
+        broadcastMessages: {
+          bitgo: {
+            from: 2,
+            payload: {
+              message: 'test-broadcast-message-bitgo-4',
+              signature: 'test-signature-bitgo-4',
+            },
+          },
+          counterParty: {
+            from: 0,
+            payload: {
+              message: 'test-broadcast-message-user-4',
+              signature: 'test-signature-user-4',
+            },
+          },
+        },
+        bitgoCommonKeychain: 'commonKeychain',
+      })
+      .reply(200, {
+        source: 'backup',
+        commonKeychain: 'commonKeychain',
+      });
+
+    const bitgoAddUserKeyNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${ecdsaCoin}/key`, {
+        commonKeychain: 'commonKeychain',
+        source: 'user',
+        keyType: 'tss',
+        isMPCv2: true,
+      })
+      .reply(200, { id: 'user-key-id', source: 'user', type: 'tss' });
+
+    const bitgoAddBackupKeyNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${ecdsaCoin}/key`, {
+        commonKeychain: 'commonKeychain',
+        source: 'backup',
+        keyType: 'tss',
+        isMPCv2: true,
+      })
+      .reply(200, { id: 'backup-key-id', source: 'backup', type: 'tss' });
+
+    const bitgoAddBitGoKeyNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${ecdsaCoin}/key`, {
+        commonKeychain: 'commonKeychain',
+        source: 'bitgo',
+        keyType: 'tss',
+        isMPCv2: true,
+      })
+      .reply(200, {
+        id: 'bitgo-key-id',
+        source: 'bitgo',
+        type: 'tss',
+        commonKeychain: 'commonKeychain',
+        isBitGo: true,
+        isTrust: false,
+        hsmType: 'institutional',
+      });
+
+    const bitgoAddWalletNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${ecdsaCoin}/wallet/add`, {
+        label: 'test-wallet', // ?
+        enterprise: 'test-enterprise',
+        multisigType: 'tss',
+        m: 2,
+        n: 3,
+        keys: ['user-key-id', 'backup-key-id', 'bitgo-key-id'],
+        walletVersion: 5,
+        type: 'advanced',
+      })
+      .reply(200, {
+        id: 'new-wallet-id',
+        users: [
+          {
+            user: 'user-id',
+            permissions: ['admin', 'spend', 'view'],
+          },
+        ],
+        coin: ecdsaCoin,
+        label: 'test-wallet',
+        m: 2,
+        n: 3,
+        keys: ['user-key-id', 'backup-key-id', 'bitgo-key-id'],
+        keySignatures: {},
+        enterprise: 'test-enterprise',
+        organization: 'org-id',
+        bitgoOrg: 'BitGo Inc',
+        tags: ['new-wallet-id', 'test-enterprise'],
+        disableTransactionNotifications: false,
+        freeze: {},
+        deleted: false,
+        approvalsRequired: 1,
+        isCold: true,
+        coinSpecific: {},
+        admin: {},
+        pendingApprovals: [],
+        allowBackupKeySigning: false,
+        clientFlags: [],
+        recoverable: false,
+        startDate: '2025-01-01T00:00:00.000Z',
+        hasLargeNumberOfAddresses: false,
+        config: {},
+        balanceString: '0',
+        confirmedBalanceString: '0',
+        spendableBalanceString: '0',
+        receiveAddress: {
+          id: 'addr-id',
+          address: '0xexample',
+          chain: 0,
+          index: 0,
+          coin: ecdsaCoin,
+          wallet: 'new-wallet-id',
+          coinSpecific: {},
+        },
+        multisigType: 'tss',
+        type: 'advanced',
+      });
+
+    const response = await agent
+      .post(`/api/v1/${ecdsaCoin}/advancedwallet/generate`)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({
+        label: 'test-wallet',
+        enterprise: 'test-enterprise',
+        multisigType: 'tss',
+      });
+
+    response.status.should.equal(200);
+    response.body.should.have.property('wallet');
+    response.body.wallet.should.have.properties({
+      id: 'new-wallet-id',
+      multisigType: 'tss',
+      type: 'advanced',
+    });
+
+    userInitNock.done();
+    backupInitNock.done();
+    userRound1Nock.done();
+    backupRound1Nock.done();
+    tssPubkeyNock.done();
+    tssSettingsNock.done();
+    bitgoRound1And2Nock.done();
+    userRound2Nock.done();
+    backupRound2Nock.done();
+    userRound3Nock.done();
+    backupRound3Nock.done();
+    bitgoRound3Nock.done();
+    userRound4Nock.done();
+    backupRound4Nock.done();
+    bitgoRound4Nock.done();
+    userFinalizeNock.done();
+    backupFinalizeNock.done();
+    bitgoAddUserKeyNock.done();
+    bitgoAddBackupKeyNock.done();
+    bitgoAddBitGoKeyNock.done();
+    bitgoAddWalletNock.done();
+  });
+
+  it('should fail when advanced wallet manager client is not configured', async () => {
+    // Create a config without advanced wallet manager settings
+    const invalidConfig: Partial<MasterExpressConfig> = {
+      appMode: AppMode.MASTER_EXPRESS,
+      port: 0,
+      bind: 'localhost',
+      timeout: 60000,
+      httpLoggerFile: '',
+      env: 'test',
+      disableEnvCheck: true,
+      authVersion: 2,
+      tlsMode: TlsMode.DISABLED,
+      clientCertAllowSelfSigned: true,
+    };
+
+    try {
+      expressApp(invalidConfig as MasterExpressConfig);
+      assert(
+        false,
+        'Expected error to be thrown when advanced wallet manager client is not configured',
+      );
+    } catch (e) {
+      (e as Error).message.should.equal(
+        'advancedWalletManagerUrl and awmServerCaCert are required',
+      );
+    }
+  });
+
+  it('should fail when multisig type is invalid / not provided', async () => {
+    const response = await agent
+      .post(`/api/v1/${coin}/advancedwallet/generate`)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({
+        label: 'test_wallet',
+        enterprise: 'test_enterprise',
+        multisigType: 'invalid',
+      });
+
+    response.status.should.equal(400);
+
+    const response2 = await agent
+      .post(`/api/v1/${coin}/advancedwallet/generate`)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({
+        label: 'test_wallet',
+        enterprise: 'test_enterprise',
+      });
+
+    response2.status.should.equal(400);
+  });
+
+  it('should fail when coin does not support TSS', async () => {
+    const response = await agent
+      .post(`/api/v1/tbtc/advancedwallet/generate`)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({
+        label: 'test_wallet',
+        enterprise: 'test_enterprise',
+        multisigType: 'tss',
+      });
+
+    response.status.should.equal(400);
+    response.body.details.should.equal('MPC wallet generation is not supported for coin tbtc');
+  });
+
+  it('should skip calls to AWM and use existing keychains when evmKeyRingReferenceWalletId is provided', async () => {
+    /** GET mocks for Key Retrieval */
+    const userKeyNock = nock(bitgoApiUrl)
+      .get(`/api/v2/${ecdsaCoin}/key/user-key-id`)
+      .reply(200, { id: 'user-key-id', source: 'user', type: 'independent' });
+
+    const backupKeyNock = nock(bitgoApiUrl)
+      .get(`/api/v2/${ecdsaCoin}/key/backup-key-id`)
+      .reply(200, { id: 'backup-key-id', source: 'backup', type: 'independent' });
+
+    const bitgoKeyNock = nock(bitgoApiUrl).get(`/api/v2/${ecdsaCoin}/key/bitgo-key-id`).reply(200, {
+      id: 'bitgo-key-id',
+      source: 'bitgo',
+      type: 'independent',
+      isBitGo: true,
+      isTrust: false,
+      hsmType: 'institutional',
+    });
+
+    /** POST mock for the actual wallet creation */
+    const walletAddNock = nock(bitgoApiUrl)
+      .post(`/api/v2/${ecdsaCoin}/wallet/add`, {
+        label: 'test_wallet',
+        evmKeyRingReferenceWalletId: '59cd72485007a239fb00282ed480da1f',
+      })
+      .matchHeader('any', () => true)
+      .reply(
+        200,
+        mockWalletResponse('new-keyring-wallet-id', ecdsaCoin, {
+          multisigType: 'tss',
+          type: 'advanced',
+        }),
+      );
+
+    const response = await agent
+      .post(`/api/v1/${ecdsaCoin}/advancedwallet/generate`)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({
+        label: 'test_wallet',
+        enterprise: 'test_enterprise',
+        multisigType: 'tss',
+        evmKeyRingReferenceWalletId: '59cd72485007a239fb00282ed480da1f',
+      });
+
+    response.status.should.equal(200);
+    response.body.wallet.id.should.equal('new-keyring-wallet-id');
+
+    /** AWM was never called — if it had been, nock would've thrown since we never mocked POST AWM calls */
+    walletAddNock.done();
+    userKeyNock.done();
+    backupKeyNock.done();
+    bitgoKeyNock.done();
+  });
+
+  it('should return 202 with jobId when async mode is enabled for onchain wallet', async () => {
+    const bridgeUrl = 'http://bridge.invalid';
+    const jobId = 'test-job-id-123';
+
+    sinon.restore();
+    const asyncBitgo = new BitGoAPI({ env: 'test' });
+    const asyncConfig = makeConfig({
+      asyncModeConfig: {
+        enabled: true,
+        awmAsyncUrl: bridgeUrl,
+        pollIntervalInMs: 30000,
+        jobTtlInSeconds: 3600,
+        jobTtlMpcInSeconds: 7200,
+      },
+    });
+
+    sinon.stub(middleware, 'prepareBitGo').callsFake(() => (req, res, next) => {
+      (req as BitGoRequest<MasterExpressConfig>).bitgo = asyncBitgo;
+      (req as BitGoRequest<MasterExpressConfig>).config = asyncConfig;
+      next();
+    });
+
+    const asyncApp = expressApp(asyncConfig);
+    const asyncAgent = request.agent(asyncApp);
+
+    const bridgeNock = nock(bridgeUrl)
+      .post(`/api/${coin}/key/independent`)
+      .matchHeader('X-OSO-Source', 'user,backup')
+      .matchHeader('X-OSO-Operation', 'multisig_keygen')
+      .reply(202, { jobId });
+
+    const response = await asyncAgent
+      .post(`/api/v1/${coin}/advancedwallet/generate`)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({ label: 'test_wallet', enterprise: 'test_enterprise', multisigType: 'onchain' });
+
+    response.status.should.equal(202);
+    response.body.should.have.property('jobId', jobId);
+    response.body.should.have.property('status', 'pending');
+    bridgeNock.done();
+  });
+
+  it('should fail when evmKeyRingReferenceWalletId is provided for a non-EVM coin', async () => {
+    const response = await agent
+      .post(`/api/v1/${coin}/advancedwallet/generate`)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({
+        label: 'test_wallet',
+        enterprise: 'test_enterprise',
+        multisigType: 'onchain',
+        evmKeyRingReferenceWalletId: '59cd72485007a239fb00282ed480da1f',
+      });
+
+    response.status.should.equal(400);
+    response.body.details.should.containEql(
+      'EVM keyring wallet generation is not supported for coin tbtc',
+    );
+  });
+
+  it('should fail when async mode is enabled for TSS wallet generation', async () => {
+    const bridgeUrl = 'http://bridge.invalid';
+    sinon.restore();
+    const asyncBitgo = new BitGoAPI({ env: 'test' });
+    const asyncConfig = makeConfig({
+      asyncModeConfig: {
+        enabled: true,
+        awmAsyncUrl: bridgeUrl,
+        pollIntervalInMs: 30000,
+        jobTtlInSeconds: 3600,
+        jobTtlMpcInSeconds: 7200,
+      },
+    });
+
+    sinon.stub(middleware, 'prepareBitGo').callsFake(() => (req, _res, next) => {
+      (req as BitGoRequest<MasterExpressConfig>).bitgo = asyncBitgo;
+      (req as BitGoRequest<MasterExpressConfig>).config = asyncConfig;
+      next();
+    });
+
+    const asyncApp = expressApp(asyncConfig);
+    const asyncAgent = request.agent(asyncApp);
+
+    const response = await asyncAgent
+      .post(`/api/v1/${eddsaCoin}/advancedwallet/generate`)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({
+        label: 'test_wallet',
+        enterprise: 'test_enterprise',
+        multisigType: 'tss',
+      });
+
+    response.status.should.equal(400);
+    response.body.details.should.containEql(
+      'Async mode is not yet supported for TSS wallet generation',
+    );
+  });
+
+  it('should fail when async mode is enabled for EVM keyring wallet generation', async () => {
+    const bridgeUrl = 'http://bridge.invalid';
+    sinon.restore();
+    const asyncBitgo = new BitGoAPI({ env: 'test' });
+    const asyncConfig = makeConfig({
+      asyncModeConfig: {
+        enabled: true,
+        awmAsyncUrl: bridgeUrl,
+        pollIntervalInMs: 30000,
+        jobTtlInSeconds: 3600,
+        jobTtlMpcInSeconds: 7200,
+      },
+    });
+
+    sinon.stub(middleware, 'prepareBitGo').callsFake(() => (req, _res, next) => {
+      (req as BitGoRequest<MasterExpressConfig>).bitgo = asyncBitgo;
+      (req as BitGoRequest<MasterExpressConfig>).config = asyncConfig;
+      next();
+    });
+
+    const asyncApp = expressApp(asyncConfig);
+    const asyncAgent = request.agent(asyncApp);
+
+    const response = await asyncAgent
+      .post(`/api/v1/eth/advancedwallet/generate`)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({
+        label: 'test_wallet',
+        enterprise: 'test_enterprise',
+        multisigType: 'onchain',
+        evmKeyRingReferenceWalletId: '59cd72485007a239fb00282ed480da1f',
+      });
+
+    response.status.should.equal(400);
+    response.body.details.should.containEql(
+      'Async mode is not yet supported for EVM keyring wallet generation',
+    );
+  });
+});
